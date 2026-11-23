@@ -1,6 +1,7 @@
 //! GcAllocator implemention
 //! not support: save ptr in usize / union(not tagged) / *anyopaque 
 //! maybe will only save what's in *anyopaque , any ptr inside usize / untagged union will be dropped
+
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
@@ -9,27 +10,27 @@ const GcAllocator = @This();
 child_allocator : Allocator,
 state: State,
 
+
 pub const State = struct{
     
-    options: GcOptions = standard,//threadsafe or standard
+    options: GcOptions = .standard,//threadsafe or standard
     
     //for gc
-    stack_list: ?*Frame = null,
-    byte_allocated: usize = 0,
+    stack_list:?*Frame = null,
+    byte_allocated:usize = 0,
     gc_threashold:usize = 1024*1024,
     stack: std.ArrayList(WorkItem) = .empty, //trace_stack
     marked_book: std.AutoHashMapUnmanaged( struct{usize , usize} , void ) = .{} , 
 
     //for pagesAllocator
     page_size:u16 = 4096 ,  //should be power of two. TODO recommand to stay 4096 else we'll need to deal with aligns.
-    size_clases:[]u16 = .{ 16,32,64,128,256,512,1024 },
+    size_clases:[]const u16 = .{ 16,32,64,128,256,512,1024 },
     page_book: std.AutoHashMapUnmanaged(usize, void)=.{} ,
     free_pages: ?*Page = null,
-    used_pages: ?[]Page = null,
+    used_pages: ?[]?*Page = null,
     //large obj
     //large_list: ?*LargeHeader = null, //seems to be useless
-    large_book:std.AutoArrayHashMapUnmanaged(usize ,void)=.{},
-    sorted_large_book:ArrayList(*LargeHeader)
+    large_book:std.AutoArrayHashMapUnmanaged(usize ,void)=.{} ,
     //pub const init:State = .{ //init移到init函式中
     //    .stack_list = null,
     //    .byte_allocated = 0,
@@ -78,7 +79,7 @@ const GcOptions=enum{
     threadsafe, 
     ///no alloc object > page_size bytes
     small 
-}
+};
 ///Type for free list in Page headers.
 const Node = struct{ 
     next: ?*Node, 
@@ -89,13 +90,13 @@ const Slot = packed struct{
     age:u7 
 };
 ///for Large obj bigger than page_size bytes , in small mode wont be needed
-const LargeHeader= packed struct{
+const LargeHeader = packed struct{
     //next:?*LargeHeader, // usize 8 bytes in 64 bit , seems to be useless
     len: u56, // 7 byte
     slot: Slot, // 1 byte
 };
 ///Mark for gc
-const Mark:enum(u1){
+const Mark = enum(u1){
     ///not marked
     White,
     ///marked 
@@ -106,20 +107,21 @@ const Mark:enum(u1){
 ///if wanna use multi threads: .{ .option=threadsafe }
 ///recommend to read source code yourself.
 pub inline fn init( child_allocator:Allocator , state :State )GcAllocator { 
-    var realstate=state;
-    realstate.used_pages:[state.size_classes.len] = @splat(null);
-    return .{ .state = realstate , child_allocator=child_allocator }; 
+    var realstate = state;
+    realstate.used_pages= @as( [ state.size_classes.len ]?*Page , @splat(null) );
+    return .{ .state = realstate , .child_allocator=child_allocator }; 
 }
 pub fn allocator(gc:*GcAllocator ) Allocator{
-    return .{
-        .ptr = gc,
-        .vtable = &.{
-            .alloc = alloc,
-            .resize = resize,
-            .remap = remap,
-            .free = free,
-        },
-    };
+   return gc.child_allocator;
+   // return .{
+   //     .ptr = gc,
+   //     .vtable = &.{
+   //         .alloc = alloc,
+   //         .resize = resize,
+   //         .remap = remap,
+   //         .free = free,
+   //     },
+   // };
 }
 fn mkFrame( Tuple:type ) type {
     return struct{
@@ -137,7 +139,7 @@ pub fn getframe( root:anytype ) mkFrame(@TypeOf(root)) {
             .next = null,
             .trace_fn = struct{
                 fn trace ( self:*Frame , gc:*GcAllocator ) !void {
-                    const frame:mkFrame(@TypeOf(root)) = @fieldParentPtr( "frame" , self ).*;
+                    const frame=@as(*mkFrame(@TypeOf(root)), @fieldParentPtr( "frame" , self ));
                     inline for ( 0..frame.tuple.len ) |i|{
                         const stackVar = frame.tuple[i];
                         try gc.mark(stackVar);
@@ -151,8 +153,8 @@ pub fn getframe( root:anytype ) mkFrame(@TypeOf(root)) {
 pub fn new( gc:*GcAllocator , frame_ptr:anytype )void{
     assert( @hasField(@typeInfo( @TypeOf( frame_ptr ) ).pointer.child , "frame" )); 
     frame_ptr.frame.next = gc.state.stack_list;
-    frame_ptr.frame.next.prev = &frame.frame;
-    gc.state.stack_list = &frame.frame;
+    frame_ptr.frame.next.prev = &frame_ptr.frame;
+    gc.state.stack_list = &frame_ptr.frame;
 }
 
 pub fn delete(gc:*GcAllocator , frame_ptr:anytype ) void{
@@ -166,7 +168,7 @@ pub fn delete(gc:*GcAllocator , frame_ptr:anytype ) void{
         gc.state.stack_list = frame_ptr.frame.next ;
     }
 }
-fn typeId ( comptime T:type ) usize{
+fn typeId ( T:type ) usize{
     const a=struct{
         var dummy:u8 = 0;
         comptime{
@@ -177,9 +179,9 @@ fn typeId ( comptime T:type ) usize{
 }
 const WorkItem = struct{
     ptr: *anyopaque,
-    expand_fn: *const fn( current: *WorkItem ,gc:*GcAllocator) !void,
-    pub fn expand( current:*WorkItem , gc:*GcAllocator )!void{
-        try current.expand_fn( current ,gc, stack , allocator );
+    expand_fn: *const fn( current: *WorkItem ,gc:*GcAllocator)Allocator.Error!void,
+    pub fn expand( current:*WorkItem , gc:*GcAllocator )Allocator.Error!void{
+        try current.expand_fn( current ,gc );
     }
     pub fn hasPtr( x:type ) bool  {
         return switch(@typeInfo(x)){
@@ -195,7 +197,7 @@ const WorkItem = struct{
             }else false,
            .error_union => |eu| WorkItem.hasPtr(eu.payload),
            else=>false,
-        }
+        };
     }
 };
 fn mkWorkItem( ptr: anytype )WorkItem{ // slice a[0..2] and a[0..1] might have a race, end up a[2] being free.
@@ -210,7 +212,7 @@ fn mkWorkItem( ptr: anytype )WorkItem{ // slice a[0..2] and a[0..1] might have a
                 const childTypeInfo = @typeInfo(childType);
                 if( comptime !WorkItem.hasPtr(childType) ) return;
                 if( !(try gc.state.marked_book.getOrPut(gc.child_allocator , .{ @intFromPtr(root),typeId(rootType)}) ).found_existing  ) {
-                    inline switch( childTypeInfo ){ // ensure this ptr,type is not already marked
+                    switch( childTypeInfo ){ // ensure this ptr,type is not already marked
                         .pointer =>{  
                             if( childTypeInfo.pointer.size == .one  ){
                                 if( gc.markSlot( root.* , .Black )){
@@ -274,19 +276,16 @@ fn mkWorkItem( ptr: anytype )WorkItem{ // slice a[0..2] and a[0..1] might have a
                                 return ;
                             }
                             inline for( childTypeInfo.@"struct".field_names )|field|{
-                                const ptr = &@field( root.* , field );
-                                //i use &@field cause i wanna flatten call stack into heap, 
-                                //using recursive instead (like packedTrace)
-                                //would have make whole program easier, but might have casue stack overflow.
-                                //so i only use recursive function in packedTrace, which is hard to get pointer 
-                                try gc.state.stack.append(
-                                    gc.child_allocator,
-                                    mkWorkItem(child)
-                                );
+                                if( comptime WorkItem.hasPtr( @TypeOf(@field(root.* , field)))){//in case is null
+                                    if(@field( root.* , field ))|structObj| try gc.state.stack.append(
+                                        gc.child_allocator,
+                                        mkWorkItem(structObj)
+                                    );
+                                }
                             }
                         },
                         .@"union"=>{
-                            if(childTypeInfo.@"union".layout ==.@"packed" ){
+                            if(childTypeInfo.@"union".layout == .@"packed" ){
                                 try gc.packedTrace(root.*);
                                 return;
                             }
@@ -301,7 +300,7 @@ fn mkWorkItem( ptr: anytype )WorkItem{ // slice a[0..2] and a[0..1] might have a
                                         if(unionObjWrapper)|unionObj| //in case unionObj is null
                                             try gc.state.stack.append(
                                                     gc.child_allocator,
-                                                    mkWorkItem(child)
+                                                    mkWorkItem(unionObj)
                                                 );
                                     }
                                 }
@@ -312,24 +311,41 @@ fn mkWorkItem( ptr: anytype )WorkItem{ // slice a[0..2] and a[0..1] might have a
                 }
             }
         }.expand_fn
-    }
+    };
 }
 fn packedTrace( gc:*GcAllocator , obj:anytype ) !void{ //obj is a packed struct or union
-    switch(@typeInfo(@TypeOf(obj))){
-    
-        ."struct"=>{
+    switch(@typeInfo(@TypeOf(obj))){ 
+        .@"struct"=>{
             for (@typeInfo(@TypeOf(obj) ).@"struct".field_names )|field|{
                 const a = @field(obj , field);
                 if( !WorkItem.hasPtr( @TypeOf(a))) continue;
                 switch( @typeInfo( @TypeOf(a) ) ){
-                    .pointer=>{
-                        if(a)|ptr|{
-                            if(gc.markSlot(ptr)) 
-                                try gc.state.stack.append(
-                                    gc.child_allocator,
-                                    workItem(ptr)
-                                );
-                        }
+                    .pointer=>|p|{
+                        if(p.size == .one ){
+                            if(a)|ptr|{
+                                if(gc.markSlot(ptr , .Black)) 
+                                    try gc.state.stack.append(
+                                        gc.child_allocator,
+                                        mkWorkItem(ptr)
+                                    );
+                            }
+                        }else if(p.size == .many){
+                            if( std.meta.sential(@TypeOf(a)) != null){
+                                    const span = std.mem.span( a );
+                                    for( span )|sliceObjWrapper|{
+                                        if(sliceObjWrapper) |sliceObj| //in case sliceObj is null
+                                            if(gc.markSlot(sliceObj,.Black)) try gc.state.stack.append(
+                                                gc.child_allocator,
+                                                mkWorkItem(sliceObj)
+                                            );
+                                    }
+                                }else if( !WorkItem.hasPtr( p.child ) ){ // [*]u8 [*]i32 or anything except a pointer
+                                    _ = gc.markSlot( a , .Black );
+                                }else{
+                                    @compileError("many pointer without a sential value and contains a pointer is not supported");
+                                }
+                        }else @compileError("c pointers not yet surported");
+                        //by the way should i just dont care on c pointers since that should be used only with c librarys
                     },  
                     .@"struct"=>{
                         try gc.packedTrace( obj );
@@ -340,7 +356,7 @@ fn packedTrace( gc:*GcAllocator , obj:anytype ) !void{ //obj is a packed struct 
                 }
             }
         }, 
-        ."union"=>{
+        .@"union"=>{
             if( WorkItem.hasPtr(@TypeOf(obj)) ) @compileError( "untagged union with ptr is unsafe" );
         },
         else=>{
@@ -350,14 +366,14 @@ fn packedTrace( gc:*GcAllocator , obj:anytype ) !void{ //obj is a packed struct 
     
 }
 
-inline fn markSlot( gc:*GcAllocator , addr:*anyopaque , mark:GcAllocator.Mark) bool {
+inline fn markSlot( gc:*GcAllocator , addr:*anyopaque , marking:GcAllocator.Mark) bool {
     if( gc.foundPage( addr ) )|page|{ 
-        page.metaSlice()[(@intFromPtr(addr) - @intFromPtr(page) - page.data_offset) / page.slot_size].mark = mark;
+        page.metaSlice()[(@intFromPtr(addr) - @intFromPtr(page) - page.data_offset) / page.slot_size].mark = marking;
         return true;
     }
     if( gc.state.options != .small ) {
         if( gc.foundLarge( addr ) )|large|{                            
-            large.mark = mark;
+            large.mark = marking;
             return true;
         }
     }
@@ -371,8 +387,11 @@ pub fn foundPage(self:*GcAllocator , ptr:*anyopaque ) ?*Page{
     
     if(pagePtrInt == 0 ) return null;
     const pagePtr:*Page = @ptrFromInt( pagePtrInt );
-    if( self.state.page_book.contains(  pagePtrInt) )  return pagePtr;
-    else return null;
+    if( self.state.page_book.contains(  pagePtrInt) ) { 
+        return pagePtr;
+    }
+    return null;
+    
 }
 pub fn foundLarge( self:*GcAllocator , ptr:*anyopaque)?*LargeHeader  {
     //should call sort first , assume after key is sorted
@@ -392,7 +411,7 @@ pub fn foundLarge( self:*GcAllocator , ptr:*anyopaque)?*LargeHeader  {
     const start = keyList[idx-1];
     const header:*LargeHeader = @ptrFromInt(start);
     if( start + @sizeOf(LargeHeader) + header.len > @intFromPtr( ptr  )  ) return header;
-    else return null;
+    return null;
 }
 fn mark( gc:*GcAllocator, ptr:anytype )!void{
     try gc.state.stack.append( 
@@ -405,10 +424,16 @@ fn mark( gc:*GcAllocator, ptr:anytype )!void{
     }   
 }
 pub fn manualGc( gc:*GcAllocator ) void {
-    var cursur = gc.state.stack_list orelse return;// TODO no stack list should be a error
-    while(cursur) |frame|{
+    if( gc.state.options != .small ) gc.large_book.sort( struct{
+        key:[]const usize,
+        pub fn lessThan(ctx: @This(), a_index: usize, b_index: usize) bool {
+            return ctx.key[a_index] < ctx.key[b_index];
+        }
+    }{.key = gc.large_book.keys() } ); 
+    var cursor = gc.state.stack_list orelse assert("where\'s your stack list?");
+    while(cursor) |frame|{
         frame.trace(gc);
-        cursur = frame.next;
+        cursor = frame.next;
     }
     gc.state.marked_book.clearRetainingCapacity();
     //scan pages ,if empty space mov it to free list.
