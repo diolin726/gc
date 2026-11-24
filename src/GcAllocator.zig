@@ -90,7 +90,7 @@ const Page = struct{
     slot_size: u16,
     cap: u16,
     ///pointer offset from Page to first element
-    data_offset: u16,
+    data_offset: u32,
     free_list: ?*Node,
     next: ?*Page,
     pub fn metaSlice( self:*Page ) []Slot {
@@ -119,7 +119,7 @@ const Page = struct{
 
         page.cap = @intCast(( page_size - @sizeOf(Page)) / (@sizeOf(Slot) + slot_size));
         assert(page.cap > 0); //structure : page , metaSlice , padding(to slot_size) , slots
-        page.data_offset = @intCast(std.mem.alignForward(usize, @intFromPtr(page) + @sizeOf(Page) + @sizeOf(Slot) * page.cap , slot_size));
+        page.data_offset = @intCast(std.mem.alignForward(usize, @intFromPtr(page) + @sizeOf(Page) + @sizeOf(Slot) * page.cap , slot_size) - @intFromPtr(page));
         var first = @intFromPtr(page) + page.data_offset ;
         var prev:?*Node = null;
         for( 0..page.cap )|_|{
@@ -284,8 +284,8 @@ fn mkWorkItem( ptr: anytype )WorkItem{ // slice a[0..2] and a[0..1] might have a
         .ptr = @ptrCast(ptr) ,
         .expand_fn = struct{
             fn expand_fn( self:*WorkItem ,gc:*GcAllocator  ) !void{
-                const rootType = @TypeOf(ptr) ;
-                const childType = @typeInfo(rootType).pointer.child;
+                const rootType = @TypeOf(ptr) ;//*struct
+                const childType = @typeInfo(rootType).pointer.child;//struct
                 if( comptime !WorkItem.hasPtr(childType) ) return;
                 const root: rootType = @ptrCast(@constCast(@alignCast(self.ptr)));
                 const childTypeInfo = @typeInfo(childType);
@@ -293,34 +293,51 @@ fn mkWorkItem( ptr: anytype )WorkItem{ // slice a[0..2] and a[0..1] might have a
                     switch( childTypeInfo ){ // ensure this ptr,type is not already marked
                         .pointer =>{  
                             if( childTypeInfo.pointer.size == .one  ){
-                                if( gc.markSlot( root.* , .Black )){
-                                    // *anyopaque will be blocked in hasPtr section but that pointer will be marked.
-                                    try gc.state.stack.append(
-                                            gc.child_allocator,
-                                            mkWorkItem(root.*)
-                                            );
+                                if( @typeInfo(childTypeInfo.pointer.child) != .optional  ){ // in case sliceObj is null
+                                    if( gc.markSlot( root.* ,.Black ) ) try gc.state.stack.append(
+                                        gc.child_allocator,
+                                        mkWorkItem( root.* )
+                                    );
+                                }else if(root.*)|opt|{
+                                    if( gc.markSlot( opt ,.Black ) ) try gc.state.stack.append(
+                                        gc.child_allocator,
+                                        mkWorkItem( opt )
+                                    );
+                                }
                                     //i am thinking that if a struct is a large obj, 
                                     //and a stack pointer point to a little part of that,
                                     //it'll end up saving all part of the struct.
                                     //but i guess that can be fixed with coping gc, which is not my goal
-                                } 
+
                             }else if(childTypeInfo.pointer.size == .slice ){
                                 for( root.* )| sliceObj |{
-                                    if( @typeInfo(childTypeInfo.pointer.child) != .optional or sliceObj!=null ) // in case sliceObj is null
+                                    if( @typeInfo(childTypeInfo.pointer.child) != .optional  ){ // in case sliceObj is null
                                         if( gc.markSlot( sliceObj ,.Black ) ) try gc.state.stack.append(
                                                 gc.child_allocator,
                                                 mkWorkItem( sliceObj )    
                                             );
+                                    }else if(sliceObj)|opt|{
+                                        if( gc.markSlot( opt ,.Black ) ) try gc.state.stack.append(
+                                            gc.child_allocator,
+                                            mkWorkItem( opt )
+                                        );
+                                    }
                                 }
                             }else if(childTypeInfo.pointer.size == .many){
                                 if( std.meta.sential(childType) != null){
                                     const span = std.mem.span( root.* );
                                     for( span )|sliceObj|{
-                                        if(@typeInfo(childTypeInfo.pointer.child) != .optional or sliceObj!=null) //in case sliceObj is null
+                                        if(@typeInfo(childTypeInfo.pointer.child) != .optional){ //in case sliceObj is null
                                             if(gc.markSlot(sliceObj,.Black)) try gc.state.stack.append(
                                                 gc.child_allocator,
                                                 mkWorkItem(sliceObj)
                                             );
+                                        }else if(sliceObj)|opt|{
+                                            if(gc.markSlot(opt,.Black)) try gc.state.stack.append(
+                                                gc.child_allocator,
+                                                mkWorkItem(opt)
+                                            );
+                                        }
                                     }
                                 }else if( !WorkItem.hasPtr( childTypeInfo.pointer.child ) ){ // [*]u8 [*]i32 or anything except a pointer
                                     _ = gc.markSlot( root.* , .Black );
@@ -356,11 +373,18 @@ fn mkWorkItem( ptr: anytype )WorkItem{ // slice a[0..2] and a[0..1] might have a
                                 return ;
                             }
                             inline for( childTypeInfo.@"struct".field_names ,0..)|field , idx|{
-                                if( comptime WorkItem.hasPtr( @TypeOf(@field(root.* , field)))){//in case is null
-                                    if(@typeInfo(childTypeInfo.@"struct".field_types[idx] ) != .optional or @field( root.* , field )!=null) try gc.state.stack.append(
-                                        gc.child_allocator,
-                                        mkWorkItem(@field( root.* , field ))
-                                    );
+                                if( comptime WorkItem.hasPtr( childTypeInfo.@"struct".field_types[idx] )){//in case is null
+                                    if(@typeInfo(childTypeInfo.@"struct".field_types[idx] ) != .optional ) {
+                                        try gc.state.stack.append(
+                                            gc.child_allocator,
+                                            mkWorkItem(@field( root.* , field ))
+                                        );
+                                    }else if(@field( root.* , field ))|opt|{
+                                        try gc.state.stack.append(
+                                            gc.child_allocator,
+                                            mkWorkItem(opt)
+                                        );
+                                    }
                                 }
                             }
                         },
