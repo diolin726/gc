@@ -7,6 +7,38 @@ const Allocator = std.mem.Allocator;
 const Alignment = std.mem.Alignment;
 const assert = std.debug.assert;
 
+const AllocatorOptions = struct {
+    ///options: standard , small , threadsafe(TODO) , debug
+    ///standard:can alloc with obj over 4096 bytes, not threadsafe
+    ///small:for fast alloc and gc with no obj over 4096 bytes , not threadsafe
+    ///threadsafe:for multi threads , still working on
+    ///debug: for debug , don't use unless debugging
+    options: modeOptions = .standard,
+    ///trigger gc if young gen is bigger than this number(byte)
+    gc_threashold:usize = 1024*1024,
+    ///if a obj is older than >= this number, it won't be count in gc_threashold
+    age_threashold:u7 = 10,
+    ///size of every page , power of two only
+    page_size:u16 = 4096 ,
+    ///size of classes in BiBoP , should be power of twos only, sort in ascending
+    ///smallest 8 , largest is recommand smaller than page_size/2
+    size_classes:[]const u16 = &.{ 16,32,64,128,256,512,1024 },
+};
+
+const modeOptions=enum{
+    ///not threadsafe , can alloc any size of obj.
+    standard,
+    /// TODO , add some locks and use some atomic actions.
+    threadsafe,
+    ///no alloc object > page_size bytes
+    small,
+    ///debug only
+    debug,
+};
+
+pub fn init( child_allocator:Allocator , comptime Gcoptions :AllocatorOptions)mkGcAllocator(Gcoptions) {
+    return .{ .child_allocator=child_allocator , .state=.{}};
+}
 fn mkGcAllocator( comptime Gcoptions:AllocatorOptions ) type {
     comptime{
         assert( Gcoptions.age_threashold < std.math.maxInt(u7) );
@@ -18,7 +50,7 @@ fn mkGcAllocator( comptime Gcoptions:AllocatorOptions ) type {
             assert( std.math.isPowerOfTwo(cursur));
         }
     }
-    const LargeBook = if (Gcoptions.mode == .small) void else std.AutoArrayHashMapUnmanaged(usize, void);
+    const LargeBook = if (Gcoptions.options == .small) void else std.AutoArrayHashMapUnmanaged(usize, void);
 
     return struct {
         const GcAllocator = @This();
@@ -37,11 +69,11 @@ const State = struct {
     marked_book: std.AutoHashMapUnmanaged( struct{usize , usize} , void ) = .{},
     stack: std.ArrayList(WorkItem) = .empty,
     //for pagesAllocator
-    page_book: std.AutoHashMapUnmanaged(usize, void)=.{} ,
+    page_book: std.AutoArrayHashMapUnmanaged(usize, void)=.{} ,
     free_pages: ?*Page = null,
     used_pages: [Gcoptions.size_classes.len]?*Page = @splat(null),
     //large obj
-    large_book:LargeBook,
+    large_book:LargeBook = .{},
 };
 ///Type for registering stack vars
 const Frame = struct{
@@ -53,7 +85,7 @@ const Frame = struct{
     }
 };
 ///Type of headers of pageAllocator
-const Page = packed struct{
+const Page = struct{
     ///size of every slot
     slot_size: u16,
     cap: u16,
@@ -61,7 +93,7 @@ const Page = packed struct{
     data_offset: u16,
     free_list: ?*Node,
     next: ?*Page,
-    pub fn metaSlice(self:*Page) []Slot {
+    pub fn metaSlice( self:*Page ) []Slot {
         const base = @intFromPtr(self);
         const meta_ptr: [*]Slot = @ptrFromInt( base + @sizeOf(Page) );
         return meta_ptr[0..self.cap];
@@ -77,6 +109,27 @@ const Page = packed struct{
     }
     pub fn allocatedSliceUnsafe(self:*Page) []u8{
         return @as([*]u8 , @ptrCast(self))[0..(self.slot_size*self.cap + self.data_offset )]; // i dont wanna use gc , or gc.page_size will be faster
+    }
+
+    pub fn initPage( page:*Page , slot_size:u16 )*Page{
+        const page_size = State.page_size;
+        page.free_list = null;
+        page.next = null;
+        page.slot_size = slot_size;
+
+        page.cap = @intCast(( page_size - @sizeOf(Page)) / (@sizeOf(Slot) + slot_size));
+        assert(page.cap > 0); //structure : page , metaSlice , padding(to slot_size) , slots
+        page.data_offset = @intCast(std.mem.alignForward(usize, @intFromPtr(page) + @sizeOf(Page) + @sizeOf(Slot) * page.cap , slot_size));
+        var first = @intFromPtr(page) + page.data_offset ;
+        var prev:?*Node = null;
+        for( 0..page.cap )|_|{
+            page.free_list = @ptrFromInt(first);
+            page.free_list.?.next = prev;
+            first += slot_size ;
+            prev = page.free_list ;
+        }
+        @memset( page.metaSlice() , .{.mark = .White , .age = 0} );
+        return page;
     }
 };
 
@@ -95,8 +148,8 @@ const Slot = packed struct{
 ///for Large obj bigger than page_size bytes , in small mode wont be needed
 const LargeHeader = packed struct{
     //next:?*LargeHeader, // usize 8 bytes in 64 bit , seems to be useless
-    len: u48, // 6 byte
-    align_log2:u8, // 1 byte
+    len: u50,     // total 7 byte
+    align_log2:u6,
     slot: Slot = .{.mark=.White , .age = 1}, // 1 byte
     pub fn allocatedSliceUnsafe( self:*LargeHeader )[]u8{
         var ptr = @intFromPtr(self);
@@ -122,7 +175,7 @@ const Mark = enum(u1){
 pub fn deinit(gc:*GcAllocator)void{
     for( gc.state.page_book.keys() )|pageInt|{ //free all pages
         const page :*Page = @ptrFromInt(pageInt);
-        gc.child_allocator.rawFree(page.allocatedSliceUnsafe(), comptime @fromBackingInt(std.math.log2(gc.state.page_size))  ,@returnAddress() );
+        gc.child_allocator.rawFree(page.allocatedSliceUnsafe(), comptime @fromBackingInt(std.math.log2(State.page_size))  ,@returnAddress() );
     }
     for(gc.state.large_book.keys())|largeInt|{
         const large:*LargeHeader = @ptrFromInt(largeInt);
@@ -152,10 +205,10 @@ fn mkFrame( Tuple:type ) type {
         tuple: Tuple,
     };
 }
-/// return a frame variable , user should use getframe(.{&a , &b});
+/// return a frame variable , user should use getFrame(.{&a , &b});
 /// to open a stack list , used for mark-sweeping
 /// to register , use gc.new( &frame ); defer gc.delete(&frame);
-pub fn getframe( root:anytype ) mkFrame(@TypeOf(root)) {
+pub fn getFrame(_ : *GcAllocator , root:anytype ) mkFrame(@TypeOf(root)) {
     return .{
         .frame=.{
             .prev = null,
@@ -175,9 +228,9 @@ pub fn getframe( root:anytype ) mkFrame(@TypeOf(root)) {
 }
 pub fn new( gc:*GcAllocator , frame_ptr:anytype )void{
     assert( @hasField(@typeInfo( @TypeOf( frame_ptr ) ).pointer.child , "frame" )); 
-    if(gc.state.stack_list){
-        frame_ptr.frame.next = gc.state.stack_list;
-        frame_ptr.frame.next.prev = &frame_ptr.frame;
+    if(gc.state.stack_list)|stack_head|{
+        frame_ptr.frame.next = stack_head;
+        stack_head.prev = &frame_ptr.frame;
     }
     gc.state.stack_list = &frame_ptr.frame;
 }
@@ -214,8 +267,8 @@ const WorkItem = struct{
             .optional=>|opt| WorkItem.hasPtr(opt.child),
             .array=>|arr| WorkItem.hasPtr(arr.child),
             .vector=>|vec| WorkItem.hasPtr(vec.child),
-            .@"struct" => |s| inline for(s.fields) |f|{
-                if(WorkItem.hasPtr(f.type)) break true;
+            .@"struct" => |s| inline for(s.field_types) |f|{
+                if(WorkItem.hasPtr(f)) break true;
             }else false,
             .@"union"  => |u| inline for(u.fields) |f|{
                 if(WorkItem.hasPtr(f.type)) break true;
@@ -232,10 +285,10 @@ fn mkWorkItem( ptr: anytype )WorkItem{ // slice a[0..2] and a[0..1] might have a
         .expand_fn = struct{
             fn expand_fn( self:*WorkItem ,gc:*GcAllocator  ) !void{
                 const rootType = @TypeOf(ptr) ;
-                const root: rootType = @ptrCast(@constCast(@alignCast(self.ptr)));
-                const childType = @typeInfo(rootType).pointer.child; 
-                const childTypeInfo = @typeInfo(childType);
+                const childType = @typeInfo(rootType).pointer.child;
                 if( comptime !WorkItem.hasPtr(childType) ) return;
+                const root: rootType = @ptrCast(@constCast(@alignCast(self.ptr)));
+                const childTypeInfo = @typeInfo(childType);
                 if( !(try gc.state.marked_book.getOrPut(gc.child_allocator , .{ @intFromPtr(root),typeId(rootType)}) ).found_existing  ) {
                     switch( childTypeInfo ){ // ensure this ptr,type is not already marked
                         .pointer =>{  
@@ -252,8 +305,8 @@ fn mkWorkItem( ptr: anytype )WorkItem{ // slice a[0..2] and a[0..1] might have a
                                     //but i guess that can be fixed with coping gc, which is not my goal
                                 } 
                             }else if(childTypeInfo.pointer.size == .slice ){
-                                for( root.* )| sliceObjWrapper |{
-                                    if(sliceObjWrapper)|sliceObj| // in case sliceObj is null
+                                for( root.* )| sliceObj |{
+                                    if( @typeInfo(childTypeInfo.pointer.child) != .optional or sliceObj!=null ) // in case sliceObj is null
                                         if( gc.markSlot( sliceObj ,.Black ) ) try gc.state.stack.append(
                                                 gc.child_allocator,
                                                 mkWorkItem( sliceObj )    
@@ -262,8 +315,8 @@ fn mkWorkItem( ptr: anytype )WorkItem{ // slice a[0..2] and a[0..1] might have a
                             }else if(childTypeInfo.pointer.size == .many){
                                 if( std.meta.sential(childType) != null){
                                     const span = std.mem.span( root.* );
-                                    for( span )|sliceObjWrapper|{
-                                        if(sliceObjWrapper) |sliceObj| //in case sliceObj is null
+                                    for( span )|sliceObj|{
+                                        if(@typeInfo(childTypeInfo.pointer.child) != .optional or sliceObj!=null) //in case sliceObj is null
                                             if(gc.markSlot(sliceObj,.Black)) try gc.state.stack.append(
                                                 gc.child_allocator,
                                                 mkWorkItem(sliceObj)
@@ -302,11 +355,11 @@ fn mkWorkItem( ptr: anytype )WorkItem{ // slice a[0..2] and a[0..1] might have a
                                 try gc.packedTrace(root.*);
                                 return ;
                             }
-                            inline for( childTypeInfo.@"struct".field_names )|field|{
+                            inline for( childTypeInfo.@"struct".field_names ,0..)|field , idx|{
                                 if( comptime WorkItem.hasPtr( @TypeOf(@field(root.* , field)))){//in case is null
-                                    if(@field( root.* , field ))|structObj| try gc.state.stack.append(
+                                    if(@typeInfo(childTypeInfo.@"struct".field_types[idx] ) != .optional or @field( root.* , field )!=null) try gc.state.stack.append(
                                         gc.child_allocator,
-                                        mkWorkItem(structObj)
+                                        mkWorkItem(@field( root.* , field ))
                                     );
                                 }
                             }
@@ -322,9 +375,9 @@ fn mkWorkItem( ptr: anytype )WorkItem{ // slice a[0..2] and a[0..1] might have a
                                 return;
                             }
                             switch( root.* ){
-                                inline else=>|unionObjWrapper|{
-                                    if(comptime WorkItem.hasPtr( @TypeOf(unionObjWrapper)) ){
-                                        if(unionObjWrapper)|unionObj| //in case unionObj is null
+                                inline else=>|unionObj|{
+                                    if(comptime WorkItem.hasPtr( @TypeOf(unionObj)) ){
+                                        if(@typeInfo(@TypeOf(unionObj)) != .optional or unionObj!=null) //in case unionObj is null
                                             try gc.state.stack.append(
                                                     gc.child_allocator,
                                                     mkWorkItem(unionObj)
@@ -333,6 +386,7 @@ fn mkWorkItem( ptr: anytype )WorkItem{ // slice a[0..2] and a[0..1] might have a
                                 }
                             }
                         },
+                        else =>{unreachable;}
                     }
                 }
             }
@@ -397,7 +451,7 @@ inline fn markSlot( gc:*GcAllocator , addr:*anyopaque , marking:GcAllocator.Mark
         page.metaSlice()[(@intFromPtr(addr) - @intFromPtr(page) - page.data_offset) / page.slot_size].mark = marking;
         return true;
     }
-    if( gc.state.options != .small ) {
+    if( State.options != .small ) {
         if( gc.foundLarge( addr ) )|large|{                            
             large.mark = marking;
             return true;
@@ -407,7 +461,7 @@ inline fn markSlot( gc:*GcAllocator , addr:*anyopaque , marking:GcAllocator.Mark
 }
 pub fn foundPage(self:*GcAllocator , ptr:*anyopaque ) ?*Page{
     const ptrInt = @intFromPtr( ptr);
-    const pagePtrInt = ptrInt & ~( self.state.page_size - 1 ); 
+    const pagePtrInt = ptrInt & ~( State.page_size - 1 );
     
     if(pagePtrInt == 0 ) return null;
     const pagePtr:*Page = @ptrFromInt( pagePtrInt );
@@ -451,41 +505,40 @@ fn mark( gc:*GcAllocator, ptr:anytype )!void{
 }
 pub fn manualGc( gc:*GcAllocator ) !void {
     
-    if( gc.state.options != .small ) gc.large_book.sort( struct{
+    if( State.options != .small ) gc.state.large_book.sort( struct{
         key:[]const usize,
         pub fn lessThan(ctx: @This(), a_index: usize, b_index: usize) bool {
             return ctx.key[a_index] < ctx.key[b_index];
         }
-    }{.key = gc.large_book.keys() } );
-
-    var cursor = gc.state.stack_list orelse assert("where\'s your stack list?");
-
+    }{.key = gc.state.large_book.keys() } );
+    assert(gc.state.stack_list != null); // where's your stack list
+    var cursor = gc.state.stack_list ;
     gc.state.marked_book.clearRetainingCapacity(); // could have been 
     while(cursor) |frame|{
         try frame.trace(gc);
         cursor = frame.next;
     }
-    if(gc.state.marked_book.size() > 65536 and gc.state.marked_book.capacity() > 8 * gc.state.marked_book.size()){
-        try gc.state.marked_book.clearAndFree( gc.child_allocator );
-        try gc.state.stack.clearAndFree(gc.child_allocator);
+    if(gc.state.marked_book.size > 65536 and gc.state.marked_book.capacity() > 8 * gc.state.marked_book.size){
+        gc.state.marked_book.clearAndFree( gc.child_allocator );
+        gc.state.stack.clearAndFree(gc.child_allocator);
     }else{
         gc.state.marked_book.clearRetainingCapacity();
     }
-    for( gc.state.used_pages.? )|*first|{
+    for( &gc.state.used_pages )|*first|{
         var prev:?*Page = null;
         var cursur:?*Page = first.*;
-        while(cursur)|*currentPage|{ 
+        while(cursur)|currentPage|{
             var deadPage = true;
             for( currentPage.metaSlice() )|*sliceObj|{
                 if(sliceObj.age == 0) continue;
                 if(sliceObj.mark == .White ) {
-                    if( sliceObj.age < gc.state.age_threashold ){
+                    if( sliceObj.age < State.age_threashold ){
                         gc.state.byte_allocated -= currentPage.slot_size;
                     }
                     sliceObj.age = 0;
-                    var node : *Node = currentPage.sliceToNode(sliceObj);
-                    if (gc.state.options == .debug ) {
-                        const x: [*]Node = node;
+                    var node : *Node = currentPage.slotToNode(sliceObj);
+                    if (State.options == .debug ) {
+                        const x: [*]Node = @ptrCast(node);
                         @memset( x[0..currentPage.slot_size/@sizeOf(Node)] , .{.next=null}  );//set to zero
                     }
                     node.next = currentPage.free_list;
@@ -493,30 +546,30 @@ pub fn manualGc( gc:*GcAllocator ) !void {
                     continue;
                 }
                 deadPage = false;
-                sliceObj = .{.White , sliceObj.age +| 1 };
-                if( sliceObj.age == gc.state.age_threashold ) gc.state.byte_allocated -= currentPage.slot_size;
+                sliceObj.* = .{.mark = .White , .age = sliceObj.age +| 1 };
+                if( sliceObj.age == State.age_threashold ) gc.state.byte_allocated -= currentPage.slot_size;
             }
             if(deadPage){
                 if( prev )|prevPage|{ //not null
                     prevPage.next = currentPage.next;
                 }else{
-                    first = currentPage.next;
+                    first.* = currentPage.next;
                 }
                 currentPage.next = gc.state.free_pages;
                 gc.state.free_pages = currentPage;
             }
             prev = cursur;
-            cursur = cursur.next;
+            cursur = cursur.?.next;
         }
     }
-    if(comptime gc.state.options != .small ){
+    if(comptime State.options != .small ){
         var i = gc.state.large_book.count();
         while( i > 0 ){
             i-=1;
 
-            const large:*LargeHeader = @ptrFromInt(gc.state.large_book.keys[i]);
+            const large:*LargeHeader = @ptrFromInt(gc.state.large_book.keys()[i]);
             if(large.slot.mark == .White){
-                if( large.slot.age <  gc.state.age_threashold) gc.state.byte_allocated -= large.len;
+                if( large.slot.age <  State.age_threashold) gc.state.byte_allocated -= large.len;
                 gc.state.large_book.swapRemoveAt(i);
                 gc.child_allocator.rawFree(
                     large.allocatedSliceUnsafe(),
@@ -524,8 +577,8 @@ pub fn manualGc( gc:*GcAllocator ) !void {
                     @returnAddress()
                 );
             }else{
-                large.slot = .{.White , large.slot.age +| 1};
-                if( large.slot.age == gc.state.age_threashold ) gc.state.byte_allocated -= large.len;
+                large.slot = .{.mark = .White ,.age = large.slot.age +| 1};
+                if( large.slot.age == State.age_threashold ) gc.state.byte_allocated -= large.len;
             }
         }
     }
@@ -538,7 +591,7 @@ fn free( ctx:*anyopaque , memory:[]u8 , alignment:Alignment , ret_addr:usize ) v
     assert(memory.len > 0);
     if(gc.foundPage( memory.ptr ))|page|{
         const slot = page.ptrToSlot( memory.ptr );
-        if(slot.age < gc.state.age_threashold ){
+        if(slot.age < State.age_threashold ){
             gc.state.byte_allocated -= page.slot_size;
         }
         slot.age = 0;
@@ -546,9 +599,9 @@ fn free( ctx:*anyopaque , memory:[]u8 , alignment:Alignment , ret_addr:usize ) v
         node.next = page.free_list;
         page.free_list = node;
     }
-    if( gc.state.options != .small and gc.state.large_book.contains( @intFromPtr(memory.ptr) - @sizeOf(LargeHeader) )){
+    if( State.options != .small and gc.state.large_book.contains( @intFromPtr(memory.ptr) - @sizeOf(LargeHeader) )){
         const head:*LargeHeader = @ptrFromInt( @intFromPtr(memory.ptr) - @sizeOf(LargeHeader) );
-        gc.state.large_book.swapRemove( @intFromPtr(head) );
+        _ = gc.state.large_book.swapRemove( @intFromPtr(head) );
         gc.child_allocator.rawFree(
             head.allocatedSliceUnsafe(),
             @fromBackingInt(head.align_log2),
@@ -563,7 +616,7 @@ fn resize( ctx:*anyopaque , memory:[]u8 , alignment:Alignment , new_len:usize , 
     _ = ret_addr;
     assert(memory.len > 0);
     assert( new_len > 0 ); 
-    if(gc.foundPage(memory.ptr))|page| return new_len <= gc.foundPage( page ).slot_size ;
+    if(gc.foundPage(memory.ptr))|page| return new_len <= page.slot_size ;
     if( new_len < memory.len ) return true;
     return false; //large obj can only shrink
 }
@@ -576,20 +629,20 @@ fn alloc( ctx:*anyopaque , n:usize , alignment:Alignment , ret_addr:usize ) ?[*]
     const gc:*GcAllocator = @ptrCast( @alignCast(ctx));
     _ = ret_addr;
     assert( n > 0 );
-    if( gc.state.byte_allocated >= gc.state.gc_threashold ){
+    if( gc.state.byte_allocated >= State.gc_threashold ){
         gc.manualGc() catch {};
     }
     const alignBytes = alignment.toByteUnits();
-    const biggestSize = gc.state.size_classes[gc.state.size_classes.len - 1 ];
+    const biggestSize = State.size_classes[State.size_classes.len - 1 ];
     if( @max(n ,  alignBytes) > biggestSize ){//align want more bytes than biggest size class
-        if(gc.state.options != .small ) return gc.allocLarge( n , alignment );
+        if(State.options != .small ) return gc.allocLarge( n , alignment );
         return null;
     }
     return gc.allocPage( n , alignment );
 }
 fn allocLarge( gc:*GcAllocator , n:usize , alignment:Alignment ) ?[*]u8{
     const alignBytes = @max(alignment.toByteUnits() , @sizeOf(LargeHeader));//size of largeheader is 8
-    var header:*LargeHeader= gc.child_allocator.rawAlloc( n+alignBytes , alignment , @returnAddress() ) orelse return null;
+    var header:*LargeHeader= @alignCast(@ptrCast( gc.child_allocator.rawAlloc( n+alignBytes , alignment , @returnAddress()) orelse return null )) ;
     header = @as(*LargeHeader ,(@ptrFromInt(@intFromPtr(header) + alignBytes - @sizeOf(LargeHeader))));
     header.* = .{ .len = @intCast(n) , .align_log2 = @intCast(@backingInt(alignment)) , .slot = .{ .mark = .White , .age = 0 }  };
     gc.state.byte_allocated += n;
@@ -599,15 +652,16 @@ fn allocPage( gc:*GcAllocator , n:usize , alignment:Alignment ) ?[*]u8{
     const alignBytes = alignment.toByteUnits();
     const choosedClass = @max( alignBytes , n );
     const idx = idxInit:{
-        for( gc.state.size_classes , 0.. )| class, idx|{
+        for( State.size_classes , 0.. )| class, idx|{
             if(class >= choosedClass){
                 break :idxInit idx;
             }
         }
+        unreachable;
     };
-    gc.state.byte_allocated += gc.state.size_classes[idx];
+    gc.state.byte_allocated += State.size_classes[idx];
     var cursur = gc.state.used_pages[idx];
-    while( cursur )|*currentPage| : (cursur = currentPage.next){
+    while( cursur )|currentPage| : (cursur = currentPage.next){
         if(currentPage.free_list)|freePtr|{
             currentPage.free_list = freePtr.next;
             return @ptrCast(@alignCast(freePtr));
@@ -617,75 +671,24 @@ fn allocPage( gc:*GcAllocator , n:usize , alignment:Alignment ) ?[*]u8{
     if( gc.state.free_pages )|page|{
         gc.state.free_pages = page.next;
         const prev = gc.state.used_pages[idx];
-        gc.state.used_pages[idx] = gc.initPage( page , gc.state.size_classes[idx] );
+        gc.state.used_pages[idx] = page.initPage( State.size_classes[idx] );
         gc.state.used_pages[idx] = prev;
         return gc.allocPage( n , alignment );
     }
 
     const tmp = gc.state.used_pages[idx];
     gc.state.used_pages[idx] = gc.newPage() orelse return null;
-    _ = gc.initPage( gc.state.used_pages[idx] , gc.state.size_classes[idx] );
-    gc.state.used_pages[idx].next = tmp;
+    _ = gc.state.used_pages[idx].?.initPage( State.size_classes[idx] );
+    gc.state.used_pages[idx].?.next = tmp;
     //register everytime a page is allocated
-    gc.state.page_book.puts( gc.child_allocator , @intFromPtr(gc.state.used_pages[idx]) , {}  ); 
+    gc.state.page_book.put( gc.child_allocator , @intFromPtr(gc.state.used_pages[idx]) , {}  ) catch {};
     return gc.allocPage( n , alignment );
 }
 fn newPage( gc:*GcAllocator )?*Page{
-    const pageSize = gc.state.page_size;
+    const pageSize = State.page_size;
     const alignment = Alignment.fromByteUnits( pageSize );
     return @ptrCast(@alignCast( gc.child_allocator.rawAlloc( pageSize , alignment , @returnAddress() )));
 } 
-fn initPage( gc:*GcAllocator , page:*Page , slot_size:u16 )*Page{
-    const page_size = gc.state.page_size;
-    page.free_list = null;
-    page.next = null;
-    page.slot_size = slot_size;
-    
-    page.cap = @intCast(( page_size - @sizeOf(Page)) / (@sizeOf(Slot) + slot_size));
-    assert(page.cap > 0); //structure : page , metaSlice , padding(to slot_size) , slots
-    page.data_offset = @intCast(std.mem.alignForward(usize, @intFromPtr(page) + @sizeOf(Page) + @sizeOf(Slot) * page.cap , slot_size));
-    var first = @intFromPtr(page) + page.data_offset ;
-    var prev:?*Node = null;
-    for( 0..page.cap )|_|{
-        page.free_list = @ptrFromInt(first);
-        page.free_list.next = prev;
-        first += slot_size ;
-        prev = page.free_list ;
-    }
-    @memset( page.metaSlice() , .{.mark = .White , .age = 0} );
-    return page;
-}
 
     };
 }
-pub fn init( child_allocator:Allocator , comptime Gcoptions :AllocatorOptions)mkGcAllocator(Gcoptions) {
-    return .{ .child_allocator=child_allocator };
-}
-const AllocatorOptions = struct {
-    ///options: standard , small , threadsafe(TODO) , debug
-    ///standard:can alloc with obj over 4096 bytes, not threadsafe
-    ///small:for fast alloc and gc with no obj over 4096 bytes , not threadsafe
-    ///threadsafe:for multi threads , still working on
-    ///debug: for debug , don't use unless debugging
-    options: modeOptions = .standard,
-    ///trigger gc if young gen is bigger than this number(byte)
-    gc_threashold:usize = 1024*1024,
-    ///if a obj is older than >= this number, it won't be count in gc_threashold
-    age_threashold:u7 = 10,
-    ///size of every page , power of two only
-    page_size:u16 = 4096 ,
-    ///size of classes in BiBoP , should be power of twos only, sort in ascending
-    ///smallest 8 , largest is recommand smaller than page_size/2
-    size_classes:[]const u16 = .{ 16,32,64,128,256,512,1024 },
-};
-
-const modeOptions=enum{
-    ///not threadsafe , can alloc any size of obj.
-    standard,
-    /// TODO , add some locks and use some atomic actions.
-    threadsafe,
-    ///no alloc object > page_size bytes
-    small,
-    ///debug only
-    debug,
-};
