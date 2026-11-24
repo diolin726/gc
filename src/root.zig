@@ -11,7 +11,7 @@ child_allocator : Allocator,
 state: State,
 
 
-pub const State = struct{
+pub const State = struct{ // TODO make some state options become a comptime const
     
     options: GcOptions = .standard,//threadsafe or standard
     
@@ -19,6 +19,7 @@ pub const State = struct{
     stack_list:?*Frame = null,
     byte_allocated:usize = 0,
     gc_threashold:usize = 1024*1024,
+    age_threashold:u7 = 10, //use with max(u7) will cause problem
     stack: std.ArrayList(WorkItem) = .empty, //trace_stack
     marked_book: std.AutoHashMapUnmanaged( struct{usize , usize} , void ) = .{} , 
 
@@ -54,22 +55,33 @@ pub const State = struct{
 const Frame = struct{
     next: ?*Frame,
     prev: ?*Frame,
-    trace_fn: *const fn( self: *Frame , gc:*GcAllocator )void, 
-    pub fn trace( self:*Frame , gc:*GcAllocator ) void{
-        self.trace_fn( self, gc );
+    trace_fn: *const fn( self: *Frame , gc:*GcAllocator ) Allocator.Error!void, 
+    pub fn trace( self:*Frame , gc:*GcAllocator ) Allocator.Error!void{
+        try self.trace_fn( self, gc );
     }
 };
 ///Type of headers of pageAllocator
 const Page = packed struct{
+    ///size of every slot
     slot_size: u16,
     cap: u16,
+    ///pointer offset from Page to first element
     data_offset: u16,
     free_list: ?*Node,
-    next_page: ?*Page,
+    next: ?*Page,
     pub fn metaSlice(self:*Page) []Slot {
-        const base: [*]u8 = @ptrCast(self);
-        const meta_ptr: [*]Slot = @ptrCast(base + @sizeOf(Page) );
+        const base = @intFromPtr(self);
+        const meta_ptr: [*]Slot = @ptrFromInt( base + @sizeOf(Page) );
         return meta_ptr[0..self.cap];
+    }
+    pub fn slotToNode( self:*Page , slotPtr:*Slot ) *Node{
+        const slotStart:usize = ( @intFromPtr(self) + @sizeOf(Page));
+        const slotCount = ( @intFromPtr(slotPtr) - slotStart )/@sizeOf(Slot);
+        return @ptrFromInt(slotCount * self.slot_size + self.data_offset + @intFromPtr(self));
+    }
+    pub fn ptrToSlot( self: *Page , nodePtr:*anyopaque ) *Slot{
+        const nodeCount = ( @intFromPtr(nodePtr) - @intFromPtr(self) - self.data_offset ) / self.slot_size ;
+        return &self.metaSlice()[nodeCount];
     }
 };
 const GcOptions=enum{
@@ -78,7 +90,9 @@ const GcOptions=enum{
     /// i'll deal with it later , add some locks and use some atomic actions.
     threadsafe, 
     ///no alloc object > page_size bytes
-    small 
+    small,
+    ///debug only
+    debug,
 };
 ///Type for free list in Page headers.
 const Node = struct{ 
@@ -87,6 +101,9 @@ const Node = struct{
 ///every metadata of element
 const Slot = packed struct{
     mark:Mark,
+    ///age is for minus byte allocated
+    ///and age = 1 means it's new, 0 means it's dead
+    ///so a memory with age = 3 means it survive 2 times
     age:u7 
 };
 ///for Large obj bigger than page_size bytes , in small mode wont be needed
@@ -96,7 +113,7 @@ const LargeHeader = packed struct{
     slot: Slot, // 1 byte
 };
 ///Mark for gc
-const Mark = enum(u1){
+const Mark = enum(u1){ 
     ///not marked
     White,
     ///marked 
@@ -250,7 +267,9 @@ fn mkWorkItem( ptr: anytype )WorkItem{ // slice a[0..2] and a[0..1] might have a
                                     @compileError("many pointer without a sential value and contains a pointer is not supported");
                                 }
                             }else{
-                                @compileError("c ptr is not yet supported");//TODO
+                                @compileError("c ptr is not yet supported");
+                                //TODO
+                                //but c ptr is actually shouldn't care since it's control by c library
                             }
                         },
                         .optional =>{
@@ -423,20 +442,65 @@ fn mark( gc:*GcAllocator, ptr:anytype )!void{
         try item.expand( gc ); 
     }   
 }
-pub fn manualGc( gc:*GcAllocator ) void {
+pub fn manualGc( gc:*GcAllocator ) !void {
+    
     if( gc.state.options != .small ) gc.large_book.sort( struct{
         key:[]const usize,
         pub fn lessThan(ctx: @This(), a_index: usize, b_index: usize) bool {
             return ctx.key[a_index] < ctx.key[b_index];
         }
-    }{.key = gc.large_book.keys() } ); 
+    }{.key = gc.large_book.keys() } );
+
     var cursor = gc.state.stack_list orelse assert("where\'s your stack list?");
+    gc.state.marked_book.clearRetainingCapacity(); // could have been 
     while(cursor) |frame|{
-        frame.trace(gc);
+        try frame.trace(gc);
         cursor = frame.next;
     }
-    gc.state.marked_book.clearRetainingCapacity();
-    //scan pages ,if empty space mov it to free list.
-    
-    //TODO
+    if(gc.state.marked_book.size() > 65536 and gc.state.marked_book.capacity() > 8 * gc.state.marked_book.size()){
+        try gc.state.marked_book.clearAndFree( gc.child_allocator );
+        try gc.state.stack.clearAndFree(gc.child_allocator);
+    }else{
+        gc.state.marked_book.clearRetainingCapacity();
+    }
+    for( gc.state.used_pages.? )|*first|{
+        var prev:?*Page = null;
+        var cursur:?*Page = first.*;
+        while(cursur)|*currentPage|{ 
+            var deadPage = true;
+            for( currentPage.metaSlice() )|*sliceObj|{
+                if(sliceObj.age == 0) continue;
+                if(sliceObj.mark == .White ) {
+                    if( sliceObj.age < gc.state.age_threashold ){
+                        gc.state.byte_allocated -= currentPage.slot_size;
+                    }
+                    sliceObj.age = 0;
+                    var node : *Node = currentPage.sliceToNode(sliceObj);
+                    if (gc.state.options == .debug ) {
+                        const x: [*]Node = node;
+                        @memset( x[0..currentPage.slot_size/@sizeOf(Node)] , .{.next=null}  );//set to zero
+                    }
+                    node.next = currentPage.free_list;
+                    currentPage.free_list = node;    
+                    continue;
+                }
+                deadPage = false;
+                sliceObj = .{.White , sliceObj.age +| 1 };
+                if( sliceObj.age == gc.state.age_threashold ) gc.state.byte_allocated -= currentPage.slot_size;
+            }
+            if(deadPage){
+                if( prev )|prevPage|{ //not null
+                    prevPage.next = currentPage.next;
+                }else{
+                    first = currentPage.next;
+                }
+                currentPage.next = gc.state.free_pages;
+                gc.state.free_pages = currentPage;
+            }
+            prev = cursur;
+            cursur = cursur.next;
+        }
+    }
 }
+
+
