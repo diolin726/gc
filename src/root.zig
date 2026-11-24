@@ -6,73 +6,48 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Alignment = std.mem.Alignment;
 const assert = std.debug.assert;
-const GcAllocator = @This();
 
-child_allocator : Allocator,
-state: State,
+fn mkGcAllocator( comptime Gcoptions:AllocatorOptions ) type {
+    comptime{
+        assert( Gcoptions.age_threashold < std.math.maxInt(u7) );
+        assert( std.math.isPowerOfTwo(Gcoptions.page_size));
+        var prev = 0;
+        for( Gcoptions.size_classes )|cursur|{
+            assert( cursur > prev );
+            prev = cursur;
+            assert( std.math.isPowerOfTwo(cursur));
+        }
+    }
+    const LargeBook = if (Gcoptions.mode == .small) void else std.AutoArrayHashMapUnmanaged(usize, void);
 
-const AllocatorOptions = struct {
-    ///options: standard , small , threadsafe(TODO) , debug
-    ///standard:can alloc with obj over 4096 bytes, not threadsafe
-    ///small:for fast alloc and gc with no obj over 4096 bytes , not threadsafe
-    ///threadsafe:for multi threads , still working on
-    ///debug: for debug , don't use unless debugging
-    options: modeOptions = .standard,
-    ///trigger gc if young gen is bigger than this number(byte)
-    gc_threashold:usize = 1024*1024,
-    ///if a obj is older than >= this number, it won't be count in gc_threashold
-    age_threashold:u7 = 10,
-    ///size of every page , power of two only
-    page_size:u16 = 4096 ,
-    ///size of classes in BiBoP , should be power of twos only, sort in ascending
-    size_classes:[]const u16 = .{ 16,32,64,128,256,512,1024 },
-};
+    return struct {
+        const GcAllocator = @This();
+        child_allocator : Allocator,
+        state:State,
 
-pub const State = struct{ // TODO make some state options become a comptime const
-    
-    options: modeOptions = .standard,
-
+const State = struct {
+    const options = Gcoptions.options;
+    const gc_threashold = Gcoptions.gc_threashold;
+    const age_threashold = Gcoptions.age_threashold;
+    const page_size = Gcoptions.page_size;
+    const size_classes = Gcoptions.size_classes;
     //for gc
     stack_list:?*Frame = null,
     byte_allocated:usize = 0,
-    gc_threashold:usize = 1024*1024,
-    age_threashold:u7 = 10, //use with max(u7) will cause problem
-    stack: std.ArrayList(WorkItem) = .empty, //trace_stack
-    marked_book: std.AutoHashMapUnmanaged( struct{usize , usize} , void ) = .{} , 
-
+    marked_book: std.AutoHashMapUnmanaged( struct{usize , usize} , void ) = .{},
+    stack: std.ArrayList(WorkItem) = .empty,
     //for pagesAllocator
-    page_size:u16 = 4096 ,  //should be power of two. TODO recommand to stay 4096 else we'll need to deal with aligns.
-    size_classes:[]const u16 = .{ 16,32,64,128,256,512,1024 },
     page_book: std.AutoHashMapUnmanaged(usize, void)=.{} ,
     free_pages: ?*Page = null,
-    used_pages: ?[]?*Page = null,
+    used_pages: [Gcoptions.size_classes.len]?*Page = @splat(null),
     //large obj
-    //large_list: ?*LargeHeader = null, //seems to be useless
-    large_book:std.AutoArrayHashMapUnmanaged(usize ,void)=.{} ,
-    //pub const init:State = .{ //init移到init函式中
-    //    .stack_list = null,
-    //    .byte_allocated = 0,
-    //    gc_threashold = 1024*1024,
-    //    page_size = 4096,
-    //    size_classes = .{16,32,64,128,256,512,1024},
-    //    page_book = .{},
-    //    free_pages=null,
-    //    used_pages=null,
-    //    large_list=null,
-    //    large_book=.{},
-    //};
-    pub fn promote(state:State , child_allocator:Allocator ) GcAllocator{
-        return .{
-            .child_allocator = child_allocator,
-            .state = state,
-        };
-    }
+    large_book:LargeBook,
 };
 ///Type for registering stack vars
 const Frame = struct{
     next: ?*Frame,
     prev: ?*Frame,
-    trace_fn: *const fn( self: *Frame , gc:*GcAllocator ) Allocator.Error!void, 
+    trace_fn: *const fn( self: *Frame , gc:*GcAllocator ) Allocator.Error!void,
     pub fn trace( self:*Frame , gc:*GcAllocator ) Allocator.Error!void{
         try self.trace_fn( self, gc );
     }
@@ -104,16 +79,7 @@ const Page = packed struct{
         return @as([*]u8 , @ptrCast(self))[0..(self.slot_size*self.cap + self.data_offset )]; // i dont wanna use gc , or gc.page_size will be faster
     }
 };
-const modeOptions=enum{
-    ///not threadsafe , can alloc any size of obj.
-    standard,
-    /// TODO , add some locks and use some atomic actions.
-    threadsafe, 
-    ///no alloc object > page_size bytes
-    small,
-    ///debug only
-    debug,
-};
+
 ///Type for free list in Page headers.
 const Node = struct{ 
     next: ?*Node, 
@@ -151,12 +117,7 @@ const Mark = enum(u1){
 ///default size class : { 16,32,64,128,256,512,1024 }, manual size class should be power of two, bigger than 8;
 ///if wanna use multi threads: .{ .option=threadsafe }
 ///recommend to read source code yourself.
-pub inline fn init( child_allocator:Allocator , state :State )GcAllocator {
-    //assert pagesize is power of two TODO
-    var realstate = state;
-    realstate.used_pages= @as( [ state.size_classes.len ]?*Page , @splat(null) );
-    return .{ .state = realstate , .child_allocator=child_allocator };
-}
+
 
 pub fn deinit(gc:*GcAllocator)void{
     for( gc.state.page_book.keys() )|pageInt|{ //free all pages
@@ -173,6 +134,7 @@ pub fn deinit(gc:*GcAllocator)void{
     gc.state.marked_book.clearAndFree(gc.child_allocator);
 
 }
+
 pub fn allocator(gc:*GcAllocator ) Allocator{
    return .{
         .ptr = gc,
@@ -371,7 +333,6 @@ fn mkWorkItem( ptr: anytype )WorkItem{ // slice a[0..2] and a[0..1] might have a
                                 }
                             }
                         },
-
                     }
                 }
             }
@@ -457,10 +418,8 @@ pub fn foundPage(self:*GcAllocator , ptr:*anyopaque ) ?*Page{
     
 }
 pub fn foundLarge( self:*GcAllocator , ptr:*anyopaque)?*LargeHeader{
-    //should call sort first , assume after key is sorted
-    //by the way , largeheader is right in front of a pointer
-    //so check it before UpperBound might be a better solve( O(1) ) TODO
     if( self.state.large_book.contains(@intFromPtr(ptr) - @sizeOf( LargeHeader))) return @ptrFromInt( @intFromPtr(ptr) - @sizeOf(LargeHeader) );
+    //this part should call sort first , assume after key is sorted
     //upperboud is for checking slices, since a pointer might point to middle of a slice
     const keyList = self.state.large_book.keys();
     if( keyList.len == 0 ) return null;
@@ -500,6 +459,7 @@ pub fn manualGc( gc:*GcAllocator ) !void {
     }{.key = gc.large_book.keys() } );
 
     var cursor = gc.state.stack_list orelse assert("where\'s your stack list?");
+
     gc.state.marked_book.clearRetainingCapacity(); // could have been 
     while(cursor) |frame|{
         try frame.trace(gc);
@@ -549,8 +509,25 @@ pub fn manualGc( gc:*GcAllocator ) !void {
             cursur = cursur.next;
         }
     }
-    if(gc.state.options != .small ){
-        //TODO
+    if(comptime gc.state.options != .small ){
+        var i = gc.state.large_book.count();
+        while( i > 0 ){
+            i-=1;
+
+            const large:*LargeHeader = @ptrFromInt(gc.state.large_book.keys[i]);
+            if(large.slot.mark == .White){
+                if( large.slot.age <  gc.state.age_threashold) gc.state.byte_allocated -= large.len;
+                gc.state.large_book.swapRemoveAt(i);
+                gc.child_allocator.rawFree(
+                    large.allocatedSliceUnsafe(),
+                    @fromBackingInt(large.align_log2),
+                    @returnAddress()
+                );
+            }else{
+                large.slot = .{.White , large.slot.age +| 1};
+                if( large.slot.age == gc.state.age_threashold ) gc.state.byte_allocated -= large.len;
+            }
+        }
     }
 }
 
@@ -576,7 +553,7 @@ fn free( ctx:*anyopaque , memory:[]u8 , alignment:Alignment , ret_addr:usize ) v
             head.allocatedSliceUnsafe(),
             @fromBackingInt(head.align_log2),
             @returnAddress()
-        );//TODO use rawFree
+        );
     }
 }
 
@@ -615,6 +592,7 @@ fn allocLarge( gc:*GcAllocator , n:usize , alignment:Alignment ) ?[*]u8{
     var header:*LargeHeader= gc.child_allocator.rawAlloc( n+alignBytes , alignment , @returnAddress() ) orelse return null;
     header = @as(*LargeHeader ,(@ptrFromInt(@intFromPtr(header) + alignBytes - @sizeOf(LargeHeader))));
     header.* = .{ .len = @intCast(n) , .align_log2 = @intCast(@backingInt(alignment)) , .slot = .{ .mark = .White , .age = 0 }  };
+    gc.state.byte_allocated += n;
     return @ptrFromInt( @intFromPtr( header ) + @sizeOf(LargeHeader));
 }
 fn allocPage( gc:*GcAllocator , n:usize , alignment:Alignment ) ?[*]u8{
@@ -627,6 +605,7 @@ fn allocPage( gc:*GcAllocator , n:usize , alignment:Alignment ) ?[*]u8{
             }
         }
     };
+    gc.state.byte_allocated += gc.state.size_classes[idx];
     var cursur = gc.state.used_pages[idx];
     while( cursur )|*currentPage| : (cursur = currentPage.next){
         if(currentPage.free_list)|freePtr|{
@@ -677,3 +656,36 @@ fn initPage( gc:*GcAllocator , page:*Page , slot_size:u16 )*Page{
     return page;
 }
 
+    };
+}
+pub fn init( child_allocator:Allocator , comptime Gcoptions :AllocatorOptions)mkGcAllocator(Gcoptions) {
+    return .{ .child_allocator=child_allocator };
+}
+const AllocatorOptions = struct {
+    ///options: standard , small , threadsafe(TODO) , debug
+    ///standard:can alloc with obj over 4096 bytes, not threadsafe
+    ///small:for fast alloc and gc with no obj over 4096 bytes , not threadsafe
+    ///threadsafe:for multi threads , still working on
+    ///debug: for debug , don't use unless debugging
+    options: modeOptions = .standard,
+    ///trigger gc if young gen is bigger than this number(byte)
+    gc_threashold:usize = 1024*1024,
+    ///if a obj is older than >= this number, it won't be count in gc_threashold
+    age_threashold:u7 = 10,
+    ///size of every page , power of two only
+    page_size:u16 = 4096 ,
+    ///size of classes in BiBoP , should be power of twos only, sort in ascending
+    ///smallest 8 , largest is recommand smaller than page_size/2
+    size_classes:[]const u16 = .{ 16,32,64,128,256,512,1024 },
+};
+
+const modeOptions=enum{
+    ///not threadsafe , can alloc any size of obj.
+    standard,
+    /// TODO , add some locks and use some atomic actions.
+    threadsafe,
+    ///no alloc object > page_size bytes
+    small,
+    ///debug only
+    debug,
+};
