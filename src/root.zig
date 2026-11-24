@@ -4,17 +4,34 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const Alignment = std.mem.Alignment;
 const assert = std.debug.assert;
 const GcAllocator = @This();
 
 child_allocator : Allocator,
 state: State,
 
+const AllocatorOptions = struct {
+    ///options: standard , small , threadsafe(TODO) , debug
+    ///standard:can alloc with obj over 4096 bytes, not threadsafe
+    ///small:for fast alloc and gc with no obj over 4096 bytes , not threadsafe
+    ///threadsafe:for multi threads , still working on
+    ///debug: for debug , don't use unless debugging
+    options: modeOptions = .standard,
+    ///trigger gc if young gen is bigger than this number(byte)
+    gc_threashold:usize = 1024*1024,
+    ///if a obj is older than >= this number, it won't be count in gc_threashold
+    age_threashold:u7 = 10,
+    ///size of every page , power of two only
+    page_size:u16 = 4096 ,
+    ///size of classes in BiBoP , should be power of twos only, sort in ascending
+    size_classes:[]const u16 = .{ 16,32,64,128,256,512,1024 },
+};
 
 pub const State = struct{ // TODO make some state options become a comptime const
     
-    options: GcOptions = .standard,//threadsafe or standard
-    
+    options: modeOptions = .standard,
+
     //for gc
     stack_list:?*Frame = null,
     byte_allocated:usize = 0,
@@ -25,7 +42,7 @@ pub const State = struct{ // TODO make some state options become a comptime cons
 
     //for pagesAllocator
     page_size:u16 = 4096 ,  //should be power of two. TODO recommand to stay 4096 else we'll need to deal with aligns.
-    size_clases:[]const u16 = .{ 16,32,64,128,256,512,1024 },
+    size_classes:[]const u16 = .{ 16,32,64,128,256,512,1024 },
     page_book: std.AutoHashMapUnmanaged(usize, void)=.{} ,
     free_pages: ?*Page = null,
     used_pages: ?[]?*Page = null,
@@ -37,7 +54,7 @@ pub const State = struct{ // TODO make some state options become a comptime cons
     //    .byte_allocated = 0,
     //    gc_threashold = 1024*1024,
     //    page_size = 4096,
-    //    size_clases = .{16,32,64,128,256,512,1024},
+    //    size_classes = .{16,32,64,128,256,512,1024},
     //    page_book = .{},
     //    free_pages=null,
     //    used_pages=null,
@@ -83,11 +100,14 @@ const Page = packed struct{
         const nodeCount = ( @intFromPtr(nodePtr) - @intFromPtr(self) - self.data_offset ) / self.slot_size ;
         return &self.metaSlice()[nodeCount];
     }
+    pub fn allocatedSliceUnsafe(self:*Page) []u8{
+        return @as([*]u8 , @ptrCast(self))[0..(self.slot_size*self.cap + self.data_offset )]; // i dont wanna use gc , or gc.page_size will be faster
+    }
 };
-const GcOptions=enum{
+const modeOptions=enum{
     ///not threadsafe , can alloc any size of obj.
     standard,
-    /// i'll deal with it later , add some locks and use some atomic actions.
+    /// TODO , add some locks and use some atomic actions.
     threadsafe, 
     ///no alloc object > page_size bytes
     small,
@@ -109,8 +129,16 @@ const Slot = packed struct{
 ///for Large obj bigger than page_size bytes , in small mode wont be needed
 const LargeHeader = packed struct{
     //next:?*LargeHeader, // usize 8 bytes in 64 bit , seems to be useless
-    len: u56, // 7 byte
-    slot: Slot, // 1 byte
+    len: u48, // 6 byte
+    align_log2:u8, // 1 byte
+    slot: Slot = .{.mark=.White , .age = 1}, // 1 byte
+    pub fn allocatedSliceUnsafe( self:*LargeHeader )[]u8{
+        var ptr = @intFromPtr(self);
+        if( self.align_log2 > 3 ) //need padding
+            ptr -= @as(usize , 1 ) << self.align_log2 ;
+        const start:[*]u8 = @ptrFromInt(ptr);
+        return start[0..(self.len + @max( self.align_log2 , @sizeOf(LargeHeader)))];
+    }
 };
 ///Mark for gc
 const Mark = enum(u1){ 
@@ -120,25 +148,41 @@ const Mark = enum(u1){
     Black,
 };
 ///default usage: const gc = GcAllocator.init( std.heap.PageAllocator , .{});
-///default size class : { 16,32,64,128,256,512,1024 }, manuel size class should be power of two, bigger than 8;
+///default size class : { 16,32,64,128,256,512,1024 }, manual size class should be power of two, bigger than 8;
 ///if wanna use multi threads: .{ .option=threadsafe }
 ///recommend to read source code yourself.
-pub inline fn init( child_allocator:Allocator , state :State )GcAllocator { 
+pub inline fn init( child_allocator:Allocator , state :State )GcAllocator {
+    //assert pagesize is power of two TODO
     var realstate = state;
     realstate.used_pages= @as( [ state.size_classes.len ]?*Page , @splat(null) );
-    return .{ .state = realstate , .child_allocator=child_allocator }; 
+    return .{ .state = realstate , .child_allocator=child_allocator };
+}
+
+pub fn deinit(gc:*GcAllocator)void{
+    for( gc.state.page_book.keys() )|pageInt|{ //free all pages
+        const page :*Page = @ptrFromInt(pageInt);
+        gc.child_allocator.rawFree(page.allocatedSliceUnsafe(), comptime @fromBackingInt(std.math.log2(gc.state.page_size))  ,@returnAddress() );
+    }
+    for(gc.state.large_book.keys())|largeInt|{
+        const large:*LargeHeader = @ptrFromInt(largeInt);
+        gc.child_allocator.rawFree(large.allocatedSliceUnsafe(), @fromBackingInt( large.align_log2 )  ,@returnAddress() );
+    }
+    gc.state.stack.clearAndFree(gc.child_allocator);
+    gc.state.page_book.clearAndFree(gc.child_allocator);
+    gc.state.large_book.clearAndFree(gc.child_allocator);
+    gc.state.marked_book.clearAndFree(gc.child_allocator);
+
 }
 pub fn allocator(gc:*GcAllocator ) Allocator{
-   return gc.child_allocator;
-   // return .{
-   //     .ptr = gc,
-   //     .vtable = &.{
-   //         .alloc = alloc,
-   //         .resize = resize,
-   //         .remap = remap,
-   //         .free = free,
-   //     },
-   // };
+   return .{
+        .ptr = gc,
+        .vtable = &.{
+            .alloc = alloc,
+           .resize = resize,
+           .remap = remap,
+           .free = free,
+       },
+   };
 }
 fn mkFrame( Tuple:type ) type {
     return struct{
@@ -169,8 +213,10 @@ pub fn getframe( root:anytype ) mkFrame(@TypeOf(root)) {
 }
 pub fn new( gc:*GcAllocator , frame_ptr:anytype )void{
     assert( @hasField(@typeInfo( @TypeOf( frame_ptr ) ).pointer.child , "frame" )); 
-    frame_ptr.frame.next = gc.state.stack_list;
-    frame_ptr.frame.next.prev = &frame_ptr.frame;
+    if(gc.state.stack_list){
+        frame_ptr.frame.next = gc.state.stack_list;
+        frame_ptr.frame.next.prev = &frame_ptr.frame;
+    }
     gc.state.stack_list = &frame_ptr.frame;
 }
 
@@ -399,21 +445,23 @@ inline fn markSlot( gc:*GcAllocator , addr:*anyopaque , marking:GcAllocator.Mark
     return false;            
 }
 pub fn foundPage(self:*GcAllocator , ptr:*anyopaque ) ?*Page{
-    //page sizes should be power of two 
-    assert( std.math.isPowerOfTwo(self.state.page_size) );
     const ptrInt = @intFromPtr( ptr);
     const pagePtrInt = ptrInt & ~( self.state.page_size - 1 ); 
     
     if(pagePtrInt == 0 ) return null;
     const pagePtr:*Page = @ptrFromInt( pagePtrInt );
-    if( self.state.page_book.contains(  pagePtrInt) ) { 
+    if( self.state.page_book.contains( pagePtrInt ) ) { 
         return pagePtr;
     }
     return null;
     
 }
-pub fn foundLarge( self:*GcAllocator , ptr:*anyopaque)?*LargeHeader  {
+pub fn foundLarge( self:*GcAllocator , ptr:*anyopaque)?*LargeHeader{
     //should call sort first , assume after key is sorted
+    //by the way , largeheader is right in front of a pointer
+    //so check it before UpperBound might be a better solve( O(1) ) TODO
+    if( self.state.large_book.contains(@intFromPtr(ptr) - @sizeOf( LargeHeader))) return @ptrFromInt( @intFromPtr(ptr) - @sizeOf(LargeHeader) );
+    //upperboud is for checking slices, since a pointer might point to middle of a slice
     const keyList = self.state.large_book.keys();
     if( keyList.len == 0 ) return null;
     const idx = std.sort.upperBound(
@@ -501,6 +549,131 @@ pub fn manualGc( gc:*GcAllocator ) !void {
             cursur = cursur.next;
         }
     }
+    if(gc.state.options != .small ){
+        //TODO
+    }
 }
 
+fn free( ctx:*anyopaque , memory:[]u8 , alignment:Alignment , ret_addr:usize ) void{
+    const gc:*GcAllocator = @ptrCast( @alignCast(ctx));
+    _ = alignment;
+    _ = ret_addr;
+    assert(memory.len > 0);
+    if(gc.foundPage( memory.ptr ))|page|{
+        const slot = page.ptrToSlot( memory.ptr );
+        if(slot.age < gc.state.age_threashold ){
+            gc.state.byte_allocated -= page.slot_size;
+        }
+        slot.age = 0;
+        const node = @as(*Node , @ptrCast(@alignCast(memory.ptr)));
+        node.next = page.free_list;
+        page.free_list = node;
+    }
+    if( gc.state.options != .small and gc.state.large_book.contains( @intFromPtr(memory.ptr) - @sizeOf(LargeHeader) )){
+        const head:*LargeHeader = @ptrFromInt( @intFromPtr(memory.ptr) - @sizeOf(LargeHeader) );
+        gc.state.large_book.swapRemove( @intFromPtr(head) );
+        gc.child_allocator.rawFree(
+            head.allocatedSliceUnsafe(),
+            @fromBackingInt(head.align_log2),
+            @returnAddress()
+        );//TODO use rawFree
+    }
+}
+
+fn resize( ctx:*anyopaque , memory:[]u8 , alignment:Alignment , new_len:usize , ret_addr:usize ) bool{
+    const gc:*GcAllocator = @ptrCast(@alignCast(ctx));
+    _ = alignment;
+    _ = ret_addr;
+    assert(memory.len > 0);
+    assert( new_len > 0 ); 
+    if(gc.foundPage(memory.ptr))|page| return new_len <= gc.foundPage( page ).slot_size ;
+    if( new_len < memory.len ) return true;
+    return false; //large obj can only shrink
+}
+
+fn remap(ctx:*anyopaque , memory:[]u8 , alignment:Alignment , new_len:usize , ret_addr:usize ) ?[*]u8{
+    return if(resize(ctx, memory, alignment, new_len ,ret_addr))memory.ptr else null;
+}
+
+fn alloc( ctx:*anyopaque , n:usize , alignment:Alignment , ret_addr:usize ) ?[*]u8 {
+    const gc:*GcAllocator = @ptrCast( @alignCast(ctx));
+    _ = ret_addr;
+    assert( n > 0 );
+    if( gc.state.byte_allocated >= gc.state.gc_threashold ){
+        gc.manualGc() catch {};
+    }
+    const alignBytes = alignment.toByteUnits();
+    const biggestSize = gc.state.size_classes[gc.state.size_classes.len - 1 ];
+    if( @max(n ,  alignBytes) > biggestSize ){//align want more bytes than biggest size class
+        if(gc.state.options != .small ) return gc.allocLarge( n , alignment );
+        return null;
+    }
+    return gc.allocPage( n , alignment );
+}
+fn allocLarge( gc:*GcAllocator , n:usize , alignment:Alignment ) ?[*]u8{
+    const alignBytes = @max(alignment.toByteUnits() , @sizeOf(LargeHeader));//size of largeheader is 8
+    var header:*LargeHeader= gc.child_allocator.rawAlloc( n+alignBytes , alignment , @returnAddress() ) orelse return null;
+    header = @as(*LargeHeader ,(@ptrFromInt(@intFromPtr(header) + alignBytes - @sizeOf(LargeHeader))));
+    header.* = .{ .len = @intCast(n) , .align_log2 = @intCast(@backingInt(alignment)) , .slot = .{ .mark = .White , .age = 0 }  };
+    return @ptrFromInt( @intFromPtr( header ) + @sizeOf(LargeHeader));
+}
+fn allocPage( gc:*GcAllocator , n:usize , alignment:Alignment ) ?[*]u8{
+    const alignBytes = alignment.toByteUnits();
+    const choosedClass = @max( alignBytes , n );
+    const idx = idxInit:{
+        for( gc.state.size_classes , 0.. )| class, idx|{
+            if(class >= choosedClass){
+                break :idxInit idx;
+            }
+        }
+    };
+    var cursur = gc.state.used_pages[idx];
+    while( cursur )|*currentPage| : (cursur = currentPage.next){
+        if(currentPage.free_list)|freePtr|{
+            currentPage.free_list = freePtr.next;
+            return @ptrCast(@alignCast(freePtr));
+        }
+    }
+    //no free space , alloc new page or get page from free pages
+    if( gc.state.free_pages )|page|{
+        gc.state.free_pages = page.next;
+        const prev = gc.state.used_pages[idx];
+        gc.state.used_pages[idx] = gc.initPage( page , gc.state.size_classes[idx] );
+        gc.state.used_pages[idx] = prev;
+        return gc.allocPage( n , alignment );
+    }
+
+    const tmp = gc.state.used_pages[idx];
+    gc.state.used_pages[idx] = gc.newPage() orelse return null;
+    _ = gc.initPage( gc.state.used_pages[idx] , gc.state.size_classes[idx] );
+    gc.state.used_pages[idx].next = tmp;
+    //register everytime a page is allocated
+    gc.state.page_book.puts( gc.child_allocator , @intFromPtr(gc.state.used_pages[idx]) , {}  ); 
+    return gc.allocPage( n , alignment );
+}
+fn newPage( gc:*GcAllocator )?*Page{
+    const pageSize = gc.state.page_size;
+    const alignment = Alignment.fromByteUnits( pageSize );
+    return @ptrCast(@alignCast( gc.child_allocator.rawAlloc( pageSize , alignment , @returnAddress() )));
+} 
+fn initPage( gc:*GcAllocator , page:*Page , slot_size:u16 )*Page{
+    const page_size = gc.state.page_size;
+    page.free_list = null;
+    page.next = null;
+    page.slot_size = slot_size;
+    
+    page.cap = @intCast(( page_size - @sizeOf(Page)) / (@sizeOf(Slot) + slot_size));
+    assert(page.cap > 0); //structure : page , metaSlice , padding(to slot_size) , slots
+    page.data_offset = @intCast(std.mem.alignForward(usize, @intFromPtr(page) + @sizeOf(Page) + @sizeOf(Slot) * page.cap , slot_size));
+    var first = @intFromPtr(page) + page.data_offset ;
+    var prev:?*Node = null;
+    for( 0..page.cap )|_|{
+        page.free_list = @ptrFromInt(first);
+        page.free_list.next = prev;
+        first += slot_size ;
+        prev = page.free_list ;
+    }
+    @memset( page.metaSlice() , .{.mark = .White , .age = 0} );
+    return page;
+}
 
