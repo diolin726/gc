@@ -2,7 +2,7 @@ const std = @import("std");
 const GcAllocator = @import("GcAllocator.zig");
 const assert = std.debug.assert;
 test "normal usage"{
-    var gc = GcAllocator.init( std.heap.page_allocator ,.{.options = .debug , .page_size = 128 , .size_classes= &.{8},  });
+    var gc = GcAllocator.init( std.heap.page_allocator ,.{.options = .standard , .page_size = 128 , .size_classes= &.{8},  });
     defer gc.deinit();
     const allocator = gc.allocator();
     var a :std.ArrayList(i32) = .empty;
@@ -15,45 +15,37 @@ test "normal usage"{
         try a.append( allocator ,@intCast(i));
     }
 }   
-const Node = struct{
-    next: ?*Node,
-};
 test "check manual gc"{
     var gc = GcAllocator.init( std.heap.page_allocator , .{.options = .debug , });
     defer gc.deinit();
 
     const allocator = gc.allocator();
-
-    var root = Node{.next = null};
+    const Node = *usize;
+    var root:Node =  undefined;
     var frame = gc.getFrame(.{&root});
     gc.new(&frame);
 
-    var tmp:i32 = undefined; //because no stack list will assert;
+    var tmp:i32 = undefined; //because no stack list will assert
     var frame2 = gc.getFrame(.{&tmp});
     gc.new(&frame2);
 
     {
-        const first = try allocator.create(Node);
-        first.* = .{ .next = null };
-        root.next = first;
+        const first = try allocator.create(usize);
+        first.* = 6767;
+        root = first;
     }
-    {
-        const sec = try allocator.create(Node);
-        sec.* = .{ .next = null };
-        root.next.?.next = sec;
-    }
-    const first = std.mem.asBytes(root.next.?) ;
-    std.debug.print( "{x}\n", .{std.mem.asBytes(root.next.?)} );
+    const first = std.mem.asBytes(root) ;
+    std.debug.print( "{x}\n", .{first} );
     try gc.manualGc();
 
-    const sec = std.mem.asBytes(root.next.?) ;
-    std.debug.print( "{x}\n",.{std.mem.asBytes(root.next.?)}  );
+    const sec = std.mem.asBytes(root) ;
+    std.debug.print( "{x}\n",.{sec}  );
 
     gc.delete(&frame);
     try gc.manualGc();
 
-    const thrid = std.mem.asBytes(root.next.?) ;
-    std.debug.print( "{x}\n", .{std.mem.asBytes(root.next.?)}  );
+    const third = std.mem.asBytes(root) ;
+    std.debug.print( "{x}\n", .{third}  );
 
-    assert( first==sec and thrid != first );
+    assert( first==sec and third != first );
 }
