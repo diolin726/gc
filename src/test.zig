@@ -16,7 +16,7 @@ test "normal usage"{
     }
 }   
 test "check manual gc"{
-    var gc = GcAllocator.init( std.heap.page_allocator , .{.options = .debug , });
+    var gc = GcAllocator.init( std.heap.page_allocator , .{.options = .standard , });
     defer gc.deinit();
 
     const allocator = gc.allocator();
@@ -34,18 +34,19 @@ test "check manual gc"{
         first.* = 6767;
         root = first;
     }
-    const first = std.mem.asBytes(root) ;
-    std.debug.print( "{x}\n", .{first} );
+    //const first = std.mem.asBytes(root) ;
+    //std.debug.print( "{x}\n", .{first} );
+    const first_val = root.*;
     try gc.manualGc();
 
-    const sec = std.mem.asBytes(root) ;
-    std.debug.print( "{x}\n",.{sec}  );
-
+    //const sec = std.mem.asBytes(root) ;
+    //std.debug.print( "{x}\n",.{sec}  );
+    const sec_val = root.*;
     gc.delete(&frame);
     try gc.manualGc();
 
-    const third = std.mem.asBytes(root) ;
-    std.debug.print( "{x}\n", .{third}  );
-
-    assert( first==sec and third != first );
+    //const third = std.mem.asBytes(root) ;
+    //std.debug.print( "{x}\n", .{third}  );
+    const third_val = root.*;
+    assert( first_val == sec_val and third_val != first_val );
 }

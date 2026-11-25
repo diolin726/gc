@@ -284,21 +284,16 @@ fn mkWorkItem( ptr: anytype )WorkItem{ // slice a[0..2] and a[0..1] might have a
         .ptr = @ptrCast(ptr) ,
         .expand_fn = struct{
             fn expand_fn( self:*WorkItem ,gc:*GcAllocator  ) !void{
-                const rootType = @TypeOf(ptr) ;//**usize
-                const childType = @typeInfo(rootType).pointer.child;//*usize
+                const rootType = @TypeOf(ptr) ;//**usize stackVar
+                const childType = @typeInfo(rootType).pointer.child;//*usize heapVar
                 if( comptime !WorkItem.hasPtr(childType) ) return; 
                 const root: rootType = @ptrCast(@constCast(@alignCast(self.ptr)));
                 const childTypeInfo = @typeInfo(childType);
-                if( State.options == .debug ) std.debug.print("touched {any}\n",.{root});
-                if( !(try gc.state.marked_book.getOrPut(gc.child_allocator , .{ @intFromPtr(root),typeId(rootType)}) ).found_existing  ) {
+                if( State.options == .debug ) std.debug.print("touched {*}\n",.{root.*});
+                if( !(try gc.state.marked_book.getOrPut(gc.child_allocator , .{ @intFromPtr(root) , typeId(rootType)}) ).found_existing  ) {
                     switch( childTypeInfo ){ // ensure this ptr,type is not already marked
                         .pointer =>{  
                             if( childTypeInfo.pointer.size == .one ){
-                                // **Node -> *Node -> Node
-                                // this part is weird, due to getFrame it'll input a ptr to a stack var ,
-                                // so root will be &stack var , which cause gc.markSlot returns false
-                                // thinking maybe we could let mark input ptr.* if ptr is a pointer?
-                                // all of this part need fixed TODO
                                 if( @typeInfo(childTypeInfo.pointer.child) != .optional  ){  
                                     if( gc.markSlot( root.* ,.Black ) ) {
                                         if(State.options == .debug ) std.debug.print("found a ptr\n",.{});
@@ -316,7 +311,7 @@ fn mkWorkItem( ptr: anytype )WorkItem{ // slice a[0..2] and a[0..1] might have a
                             }else if(childTypeInfo.pointer.size == .slice ){
                                 for( root.* )| sliceObj |{
                                     if( @typeInfo(childTypeInfo.pointer.child) != .optional  ){ // in case sliceObj is null
-                                        if( gc.markSlot( sliceObj ,.Black ) ) try gc.state.stack.append(
+                                        if( gc.markSlot( sliceObj , .Black ) ) try gc.state.stack.append(
                                                 gc.child_allocator,
                                                 mkWorkItem( sliceObj )    
                                             );
@@ -362,19 +357,12 @@ fn mkWorkItem( ptr: anytype )WorkItem{ // slice a[0..2] and a[0..1] might have a
                                 );
                             }
                         },
-                        inline .array, .vector=>{
-                            inline for( root.* )|child|{ // TODO childTypeInfo.pointer while chileTypeInfo = .array or .vec
-                                if( @typeInfo( childTypeInfo.pointer.child ) != .optional ){ //in case child is null
-                                    if( gc.markSlot( child , .Black) ) try gc.state.stack.append(
-                                        gc.child_allocator , 
-                                        mkWorkItem(child)
-                                    );
-                                }else if(child)|opt|{
-                                    if(gc.markSlot( opt , .Black )) try gc.state.stack.append(
-                                        gc.child_allocator,
-                                        mkWorkItem(opt)
-                                        );
-                                }
+                        inline .array, .vector=>{ 
+                            inline for( root.* )| *child |{ // TODO childTypeInfo.pointer while chileTypeInfo = .array or .vec
+                                if( gc.markSlot( child , .Black) ) try gc.state.stack.append(
+                                    gc.child_allocator , 
+                                    mkWorkItem(child)
+                                );
                             }
                         },
                         .@"struct"=>{
@@ -496,9 +484,11 @@ inline fn markSlot( gc:*GcAllocator , addr:*anyopaque , marking:GcAllocator.Mark
     return false;            
 }
 pub fn foundPage(self:*GcAllocator , ptr:*anyopaque ) ?*Page{
-    const ptrInt = @intFromPtr( ptr);
-    const pagePtrInt = ptrInt & ~( State.page_size - 1 );
     
+    const ptrInt = @intFromPtr( ptr);
+    if(State.options == .debug) std.debug.print("foundPage:finding ptr {}\n" ,.{ptrInt});
+    const pagePtrInt = ptrInt & ~(@as( usize ,  State.page_size) - 1 ); // Page header is aligned with page_size , so ptrInt align to page_size will be Pageheader
+    if(State.options == .debug) std.debug.print("foundPage:page should be at {}\n" ,.{pagePtrInt });
     if(pagePtrInt == 0 ) return null;
     const pagePtr:*Page = @ptrFromInt( pagePtrInt );
     if( self.state.page_book.contains( pagePtrInt ) ) { 
@@ -530,9 +520,14 @@ pub fn foundLarge( self:*GcAllocator , ptr:*anyopaque)?*LargeHeader{
     return null;
 }
 fn mark( gc:*GcAllocator, ptr:anytype )!void{
+    const rootTypeInfo = @typeInfo( @TypeOf(ptr));
+    assert( rootTypeInfo == .pointer );
+    //const childTypeInfo = @typeInfo( rootTypeInfo.pointer.child );
+    //const realWorkItem = if( comptime childTypeInfo == .pointer ) mkWorkItem( ptr.* ) else mkWorkItem( ptr );
     try gc.state.stack.append( 
         gc.child_allocator,
-        mkWorkItem( ptr ) 
+        mkWorkItem(ptr)
+        //realWorkItem 
         );
     while( gc.state.stack.pop() )|workitem|{
         var item = workitem;
@@ -671,11 +666,11 @@ fn alloc( ctx:*anyopaque , n:usize , alignment:Alignment , ret_addr:usize ) ?[*]
     const alignBytes = alignment.toByteUnits();
     const biggestSize = State.size_classes[State.size_classes.len - 1 ];
     if( @max(n ,  alignBytes) > biggestSize ){//align want more bytes than biggest size class
-        if(State.options == .debug )std.debug.print("is Large\n",.{});
+        if(State.options == .debug )std.debug.print("alloc:is Large\n",.{});
         if(State.options != .small ) return gc.allocLarge( n , alignment );
         return null;
     }
-    if(State.options == .debug) std.debug.print("is Page\n" , .{});
+    if(State.options == .debug) std.debug.print("alloc:is Page\n" , .{});
     return gc.allocPage( n , alignment );
 }
 fn allocLarge( gc:*GcAllocator , n:usize , alignment:Alignment ) ?[*]u8{
@@ -703,11 +698,11 @@ fn allocPage( gc:*GcAllocator , n:usize , alignment:Alignment ) ?[*]u8{
         if(currentPage.free_list)|freePtr|{
             currentPage.free_list = freePtr.next;
             currentPage.ptrToSlot(freePtr).age = 1; 
-            if(State.options == .debug ) std.debug.print("found a space, {any}\n",.{ currentPage.ptrToSlot(freePtr) }  );
+            if(State.options == .debug ) std.debug.print("allocPage:found a space, at {*}, Slot {any}, Page Header at {}\n",.{ freePtr , currentPage.ptrToSlot(freePtr) , @intFromPtr(currentPage) }  );
             return @ptrCast(@alignCast(freePtr));
         }
     }
-    if(State.options == .debug ) std.debug.print("no free ptr\n",.{});
+    if(State.options == .debug ) std.debug.print("allocPage:no free ptr\n",.{});
     //no free space , alloc new page or get page from free pages
     if( gc.state.free_pages )|page|{
         gc.state.free_pages = page.next;
@@ -716,7 +711,7 @@ fn allocPage( gc:*GcAllocator , n:usize , alignment:Alignment ) ?[*]u8{
         gc.state.used_pages[idx] = prev;
         return gc.allocPage( n , alignment );
     }
-    if(State.options == .debug ) std.debug.print("no free page, allocing\n" ,.{});
+    if(State.options == .debug ) std.debug.print("allocPage:no free page, allocing\n" ,.{});
     const tmp = gc.state.used_pages[idx];
     gc.state.used_pages[idx] = gc.newPage() orelse return null;
     _ = gc.state.used_pages[idx].?.initPage( State.size_classes[idx] );
